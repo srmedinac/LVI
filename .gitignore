@@ -1,0 +1,60 @@
+# Data (too large for git)
+trident_outputs/
+yolo_lvi/
+*.h5
+*.svs
+*.ndpi
+*.tiff
+*.mrxs
+
+# Checkpoints
+pipeline/checkpoints/*.pth
+*.pt
+
+# Results (generated)
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Environment
+.env
+*.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# R artifacts
+.Rhistory
+.RData
+*.Rproj.user
+
+# Misc
+*.log
+vessel_scores_h5/
+mil2_predict/
+deep_survival/
+mibc_emory_lv/
+
+# Large files
+*.zip
+*.xlsx
+*.docx
+~$*
+
+# Generated images (can regenerate)
+*.png
+
+# PDFs
+*.pdf
