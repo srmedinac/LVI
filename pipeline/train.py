@@ -72,15 +72,16 @@ def train_joint_model(train_loader, val_loader, epochs=JOINT_EPOCHS):
             lvi = lvi.to(DEVICE)
 
             optimizer.zero_grad()
-            risk_scores, lvi_logits = model(features)
+
+            # Single forward pass with patch predictions
+            risk_scores, lvi_logits, patch_lvi_logits, patch_lvi_probs = model(
+                features, return_patch_predictions=True
+            )
 
             cox_loss = neg_partial_log_likelihood(risk_scores, events, times)
             lvi_loss = bce_loss(lvi_logits, lvi)
 
             # Sparsity loss (entropy of patch LVI probs)
-            _, _, patch_lvi_logits, patch_lvi_probs = model(
-                features, return_patch_predictions=True
-            )
             entropy = -torch.sum(
                 patch_lvi_probs * torch.log(patch_lvi_probs + 1e-8), dim=1
             )
@@ -121,7 +122,9 @@ def train_joint_model(train_loader, val_loader, epochs=JOINT_EPOCHS):
                 times = times.to(DEVICE)
                 lvi = lvi.to(DEVICE)
 
-                risk_scores, lvi_logits = model(features)
+                risk_scores, lvi_logits, _, patch_probs = model(
+                    features, return_patch_predictions=True
+                )
                 val_risks.extend(risk_scores.cpu().numpy())
                 val_events.extend(events.cpu().numpy())
                 val_times.extend(times.cpu().numpy())
@@ -129,9 +132,6 @@ def train_joint_model(train_loader, val_loader, epochs=JOINT_EPOCHS):
                 cox_loss = neg_partial_log_likelihood(risk_scores, events, times)
                 lvi_loss_val = bce_loss(lvi_logits, lvi)
 
-                _, _, _, patch_probs = model(
-                    features, return_patch_predictions=True
-                )
                 entropy = -torch.sum(
                     patch_probs * torch.log(patch_probs + 1e-8), dim=1
                 )
@@ -157,10 +157,12 @@ def train_joint_model(train_loader, val_loader, epochs=JOINT_EPOCHS):
 
         scheduler.step(avg_val)
 
+        gate_val = torch.sigmoid(model.fusion_gate).item()
+
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(
                 f"Epoch {epoch+1}: Train={avg_train:.4f}, Val={avg_val:.4f}, "
-                f"C-index={val_c_index:.3f}"
+                f"C-index={val_c_index:.3f}, gate={gate_val:.3f}"
             )
 
         if avg_val < best_loss:
@@ -253,8 +255,10 @@ def train_lvi_only_model(train_loader, epochs=ABLATION_EPOCHS):
 
             total_loss += lvi_loss.item()
 
+        gate_val = torch.sigmoid(model.fusion_gate).item()
+
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1}: LVI Loss = {total_loss/len(train_loader):.4f}")
+            print(f"Epoch {epoch+1}: LVI Loss = {total_loss/len(train_loader):.4f}, gate={gate_val:.3f}")
 
     torch.save(
         model.state_dict(),

@@ -25,9 +25,33 @@ TCGA_FILTERED_FEATS_PATH = os.path.join(
     "trident_outputs/mibc_TCGA/20x_512px_0px_overlap/filtered_conch_v15_LVI",
 )
 
-TCGA_PATCHES_PATH = os.path.join(
+TCGA_PATCHES_H5_PATH = os.path.join(
     PROJECT_ROOT,
     "trident_outputs/mibc_TCGA/20x_512px_0px_overlap/patches",
+)
+
+# ── WSI image directories ────────────────────────────────────────────────────
+EMORY_WSI_DIR = "/home/smedin7/g_drive/emory_datasets/pathomics_data/gu/bladder/cancer/institutional/emory/EmoryBladderCancer/images"
+TCGA_WSI_DIR = "/home/smedin7/g_drive/emory_datasets/pathomics_data/gu/bladder/cancer/public/TCGA/TCGA-BLCA_only_SVS"
+
+# ── Emory preprocessing paths ────────────────────────────────────────────────
+EMORY_PATCHES_H5_PATH = os.path.join(
+    PROJECT_ROOT,
+    "trident_outputs/emory_mibc/20x_512px_0px_overlap/patches",
+)
+
+EMORY_SLIDE_FEATS_PATH = os.path.join(
+    PROJECT_ROOT,
+    "trident_outputs/emory_mibc/20x_512px_0px_overlap/features_conch_v15",
+)
+
+EMORY_YOLO_PREDICTIONS_PATH = os.path.join(
+    PROJECT_ROOT, "yolo_predictions/emory",
+)
+
+EMORY_FILTERED_SLIDE_FEATS_PATH = os.path.join(
+    PROJECT_ROOT,
+    "trident_outputs/emory_mibc/20x_512px_0px_overlap/filtered_conch_v15_LVI",
 )
 
 TCGA_YOLO_PREDICTIONS_PATH = os.path.join(

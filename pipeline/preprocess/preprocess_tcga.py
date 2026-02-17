@@ -1,7 +1,7 @@
-"""End-to-end TCGA preprocessing: YOLO predict → bbox-level filter → filtered H5s.
+"""End-to-end TCGA preprocessing: YOLO predict (on-the-fly) → bbox-level filter → filtered H5s.
 
-Runs vessel detection on TCGA patches and filters features to match the
-Emory training pipeline (vessel-filtered features only).
+Runs vessel detection on TCGA WSIs (tiles read on-the-fly from H5 coords)
+and filters features to match the Emory training pipeline.
 
 Usage:
     # Full pipeline (predict + filter)
@@ -9,12 +9,6 @@ Usage:
 
     # Filter only (predictions already exist)
     python -m pipeline.preprocess.preprocess_tcga --skip_predict
-
-    # Custom paths
-    python -m pipeline.preprocess.preprocess_tcga \
-        --patches_dir /path/to/patches \
-        --h5_dir /path/to/features \
-        --output_dir /path/to/filtered
 """
 
 import argparse
@@ -22,20 +16,22 @@ import os
 
 from pipeline.config import (
     TCGA_FEATS_PATH, TCGA_FILTERED_FEATS_PATH,
-    TCGA_PATCHES_PATH, TCGA_YOLO_PREDICTIONS_PATH,
-    YOLO_WEIGHTS,
+    TCGA_PATCHES_H5_PATH, TCGA_YOLO_PREDICTIONS_PATH,
+    TCGA_WSI_DIR, YOLO_WEIGHTS, YOLO_TILE_SIZE,
 )
 from pipeline.preprocess.filter_h5 import filter_h5_by_yolo
-from pipeline.preprocess.yolo_predict import predict_wsi_patches
+from pipeline.preprocess.yolo_predict import predict_all_wsis
 
 
 def preprocess_tcga(
-    patches_dir=TCGA_PATCHES_PATH,
+    wsi_dir=TCGA_WSI_DIR,
+    patches_h5_dir=TCGA_PATCHES_H5_PATH,
     h5_dir=TCGA_FEATS_PATH,
     yolo_dir=TCGA_YOLO_PREDICTIONS_PATH,
     output_dir=TCGA_FILTERED_FEATS_PATH,
     model_path=YOLO_WEIGHTS,
     skip_predict=False,
+    tile_size=YOLO_TILE_SIZE,
     conf=0.4,
     iou=0.5,
     nms_iou=0.5,
@@ -45,25 +41,21 @@ def preprocess_tcga(
     """Run full TCGA preprocessing pipeline.
 
     Steps:
-        1. Run YOLO vessel detection on TCGA patches (unless skip_predict=True)
+        1. Run YOLO vessel detection on TCGA tiles (on-the-fly from WSIs)
         2. Filter H5 features by bbox-level detection overlap
         3. Output filtered H5s ready for inference
     """
     # Step 1: YOLO prediction
     if not skip_predict:
-        if not os.path.isdir(patches_dir):
-            raise FileNotFoundError(
-                f"TCGA patches directory not found: {patches_dir}\n"
-                "Either transfer YOLO predictions and use --skip_predict, "
-                "or ensure patches are available."
-            )
         print("=" * 60)
-        print("Step 1: Running YOLO vessel detection on TCGA patches")
+        print("Step 1: Running YOLO vessel detection on TCGA WSIs")
         print("=" * 60)
-        predict_wsi_patches(
+        predict_all_wsis(
             model_path=model_path,
-            patches_dir=patches_dir,
+            wsi_dir=wsi_dir,
+            patches_h5_dir=patches_h5_dir,
             output_dir=yolo_dir,
+            tile_size=tile_size,
             conf=conf,
             iou=iou,
             device=device,
@@ -75,7 +67,7 @@ def preprocess_tcga(
     if not os.path.isdir(yolo_dir):
         raise FileNotFoundError(
             f"YOLO predictions directory not found: {yolo_dir}\n"
-            "Run without --skip_predict or transfer predictions first."
+            "Run without --skip_predict first."
         )
 
     # Step 2: Filter H5 features
@@ -100,25 +92,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="TCGA preprocessing: YOLO predict + filter H5 features"
     )
-    parser.add_argument(
-        "--patches_dir", default=TCGA_PATCHES_PATH,
-        help="TCGA WSI patches directory"
-    )
-    parser.add_argument(
-        "--h5_dir", default=TCGA_FEATS_PATH,
-        help="TCGA unfiltered H5 features directory"
-    )
-    parser.add_argument(
-        "--yolo_dir", default=TCGA_YOLO_PREDICTIONS_PATH,
-        help="YOLO predictions output directory"
-    )
-    parser.add_argument(
-        "--output_dir", default=TCGA_FILTERED_FEATS_PATH,
-        help="Filtered H5 output directory"
-    )
+    parser.add_argument("--wsi_dir", default=TCGA_WSI_DIR)
+    parser.add_argument("--patches_h5_dir", default=TCGA_PATCHES_H5_PATH)
+    parser.add_argument("--h5_dir", default=TCGA_FEATS_PATH)
+    parser.add_argument("--yolo_dir", default=TCGA_YOLO_PREDICTIONS_PATH)
+    parser.add_argument("--output_dir", default=TCGA_FILTERED_FEATS_PATH)
     parser.add_argument("--model", default=YOLO_WEIGHTS, help="YOLO weights path")
-    parser.add_argument("--skip_predict", action="store_true",
-                        help="Skip YOLO prediction (use existing predictions)")
+    parser.add_argument("--skip_predict", action="store_true")
     parser.add_argument("--conf", type=float, default=0.4)
     parser.add_argument("--iou", type=float, default=0.5)
     parser.add_argument("--nms_iou", type=float, default=0.5)
@@ -127,7 +107,8 @@ def main():
     args = parser.parse_args()
 
     preprocess_tcga(
-        patches_dir=args.patches_dir,
+        wsi_dir=args.wsi_dir,
+        patches_h5_dir=args.patches_h5_dir,
         h5_dir=args.h5_dir,
         yolo_dir=args.yolo_dir,
         output_dir=args.output_dir,
