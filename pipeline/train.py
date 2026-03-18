@@ -46,14 +46,14 @@ def train_joint_model(train_loader, val_loader, epochs=JOINT_EPOCHS):
 
     model = SurvivalModel().to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=SCHEDULER_PATIENCE, factor=SCHEDULER_FACTOR
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
     )
     bce_loss = nn.BCEWithLogitsLoss()
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    best_loss = float("inf")
+    best_val_ci = 0.0
     patience_counter = 0
 
     for epoch in range(epochs):
@@ -112,61 +112,33 @@ def train_joint_model(train_loader, val_loader, epochs=JOINT_EPOCHS):
 
         # ── Validation ────────────────────────────────────────────────────
         model.eval()
-        val_loss = 0.0
         val_risks, val_events, val_times = [], [], []
 
         with torch.no_grad():
             for features, events, times, lvi in val_loader:
                 features = {"features": features.to(DEVICE)}
-                events = events.bool().to(DEVICE)
-                times = times.to(DEVICE)
-                lvi = lvi.to(DEVICE)
-
-                risk_scores, lvi_logits, _, patch_probs = model(
-                    features, return_patch_predictions=True
-                )
+                risk_scores, lvi_logits = model(features)
                 val_risks.extend(risk_scores.cpu().numpy())
                 val_events.extend(events.cpu().numpy())
                 val_times.extend(times.cpu().numpy())
-
-                cox_loss = neg_partial_log_likelihood(risk_scores, events, times)
-                lvi_loss_val = bce_loss(lvi_logits, lvi)
-
-                entropy = -torch.sum(
-                    patch_probs * torch.log(patch_probs + 1e-8), dim=1
-                )
-                sparsity = torch.mean(entropy)
-
-                lvi_probs = torch.sigmoid(lvi_logits)
-                consistency = F.l1_loss(
-                    torch.tanh(risk_scores / 3.0), 2 * lvi_probs - 1
-                )
-
-                val_loss += (
-                    COX_WEIGHT * cox_loss
-                    + LVI_WEIGHT * lvi_loss_val
-                    + SPARSITY_WEIGHT * sparsity
-                    + CONSISTENCY_SCALE * CONSISTENCY_WEIGHT * consistency
-                ).item()
 
         val_c_index = concordance_index(
             np.array(val_times), -np.array(val_risks), np.array(val_events)
         )
         avg_train = total_loss / len(train_loader)
-        avg_val = val_loss / len(val_loader)
 
-        scheduler.step(avg_val)
+        scheduler.step()
 
         gate_val = torch.sigmoid(model.fusion_gate).item()
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(
-                f"Epoch {epoch+1}: Train={avg_train:.4f}, Val={avg_val:.4f}, "
-                f"C-index={val_c_index:.3f}, gate={gate_val:.3f}"
+                f"Epoch {epoch+1}: Train={avg_train:.4f}, "
+                f"Val C-index={val_c_index:.3f}, gate={gate_val:.3f}"
             )
 
-        if avg_val < best_loss:
-            best_loss = avg_val
+        if val_c_index > best_val_ci:
+            best_val_ci = val_c_index
             patience_counter = 0
             torch.save(
                 model.state_dict(),
@@ -179,7 +151,7 @@ def train_joint_model(train_loader, val_loader, epochs=JOINT_EPOCHS):
             print(f"Early stopping at epoch {epoch+1}")
             break
 
-    print(f"Best val loss: {best_loss:.4f}")
+    print(f"Best val C-index: {best_val_ci:.4f}")
     return model
 
 
@@ -191,6 +163,9 @@ def train_survival_only_model(train_loader, epochs=ABLATION_EPOCHS):
 
     model = SurvivalOnlyModel().to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
+    )
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -214,6 +189,8 @@ def train_survival_only_model(train_loader, epochs=ABLATION_EPOCHS):
 
             total_loss += cox_loss.item()
 
+        scheduler.step()
+
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(f"Epoch {epoch+1}: Survival Loss = {total_loss/len(train_loader):.4f}")
 
@@ -232,6 +209,9 @@ def train_lvi_only_model(train_loader, epochs=ABLATION_EPOCHS):
 
     model = LVIOnlyModel().to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
+    )
     bce_loss = nn.BCEWithLogitsLoss()
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -255,6 +235,7 @@ def train_lvi_only_model(train_loader, epochs=ABLATION_EPOCHS):
 
             total_loss += lvi_loss.item()
 
+        scheduler.step()
         gate_val = torch.sigmoid(model.fusion_gate).item()
 
         if (epoch + 1) % 10 == 0 or epoch == 0:

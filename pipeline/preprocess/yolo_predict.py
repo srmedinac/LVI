@@ -2,7 +2,7 @@
 
 Reads patch coordinates from trident H5 files, groups 512px patches into
 2048x2048 tiles, reads each tile from the WSI via openslide, and runs YOLO
-in batched mode. Saves only detection labels (no tile images on disk).
+in batched mode. Uses threaded prefetching to overlap I/O with GPU inference.
 
 Usage:
     python -m pipeline.preprocess.yolo_predict \
@@ -14,6 +14,9 @@ Usage:
 import argparse
 import os
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Empty
+from threading import Thread
 
 import h5py
 import numpy as np
@@ -25,20 +28,12 @@ from ultralytics import YOLO
 
 from pipeline.config import YOLO_WEIGHTS, YOLO_TILE_SIZE
 
-# Conservative default — ~1GB VRAM for batch of 4 tiles at imgsz=1024
-DEFAULT_BATCH_SIZE = 4
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_NUM_WORKERS = 8
 
 
 def coords_to_tiles(patch_coords, tile_size=YOLO_TILE_SIZE):
-    """Group 512px patch coordinates into tile-sized regions.
-
-    Args:
-        patch_coords: (N, 2) array of patch top-left (x, y) in WSI pixels.
-        tile_size: Tile size for YOLO (default 2048).
-
-    Returns:
-        List of (tile_x, tile_y) tuples representing unique tile origins.
-    """
+    """Group 512px patch coordinates into tile-sized regions."""
     tile_origins = set()
     for x, y in patch_coords:
         tile_x = int(x // tile_size) * tile_size
@@ -48,11 +43,7 @@ def coords_to_tiles(patch_coords, tile_size=YOLO_TILE_SIZE):
 
 
 def read_tile(slide, tile_x, tile_y, tile_size):
-    """Read a tile from the WSI, padding edge tiles to full size.
-
-    Returns:
-        PIL Image of size (tile_size, tile_size) in RGB.
-    """
+    """Read a tile from the WSI, padding edge tiles to full size."""
     slide_w, slide_h = slide.dimensions
     read_w = min(tile_size, slide_w - tile_x)
     read_h = min(tile_size, slide_h - tile_y)
@@ -71,11 +62,7 @@ def read_tile(slide, tile_x, tile_y, tile_size):
 
 
 def save_batch_results(results, tile_infos, labels_dir, tile_size):
-    """Save YOLO results for a batch of tiles.
-
-    Returns:
-        Number of detections saved.
-    """
+    """Save YOLO results for a batch of tiles."""
     det_count = 0
     for result, (tile_x, tile_y) in zip(results, tile_infos):
         boxes = result.boxes
@@ -100,6 +87,46 @@ def save_batch_results(results, tile_infos, labels_dir, tile_size):
     return det_count
 
 
+def prefetch_tiles(wsi_path, tiles, tile_size, batch_size, queue, num_workers):
+    """Read tiles in parallel threads (each with own slide handle) into queue."""
+    import threading
+
+    # Thread-local slide handles to avoid contention
+    _local = threading.local()
+
+    def _read_one(args):
+        tile_x, tile_y = args
+        if not hasattr(_local, 'slide'):
+            _local.slide = openslide.OpenSlide(wsi_path)
+        img = read_tile(_local.slide, tile_x, tile_y, tile_size)
+        if img is not None:
+            return (img, (tile_x, tile_y))
+        return None
+
+    batch_imgs = []
+    batch_infos = []
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        for result in pool.map(_read_one, tiles):
+            if result is None:
+                continue
+            img, info = result
+            batch_imgs.append(img)
+            batch_infos.append(info)
+
+            if len(batch_imgs) >= batch_size:
+                queue.put((list(batch_imgs), list(batch_infos)))
+                batch_imgs.clear()
+                batch_infos.clear()
+
+    # Remaining tiles
+    if batch_imgs:
+        queue.put((list(batch_imgs), list(batch_infos)))
+
+    # Sentinel
+    queue.put(None)
+
+
 def predict_wsi_onthefly(
     model,
     wsi_path,
@@ -112,8 +139,9 @@ def predict_wsi_onthefly(
     imgsz=1024,
     device="cuda",
     half=True,
+    num_workers=DEFAULT_NUM_WORKERS,
 ):
-    """Run batched YOLO on tiles read on-the-fly from a single WSI."""
+    """Run batched YOLO on tiles with threaded prefetching for I/O overlap."""
     with h5py.File(patches_h5_path, "r") as f:
         if "coords" not in f:
             return 0
@@ -123,42 +151,31 @@ def predict_wsi_onthefly(
     if not tiles:
         return 0
 
-    slide = openslide.OpenSlide(wsi_path)
-
     labels_dir = os.path.join(output_dir, "labels")
     os.makedirs(labels_dir, exist_ok=True)
 
+    slide_name = os.path.basename(wsi_path)[:40]
+    n_tiles = len(tiles)
+
+    # Start prefetch thread — each worker opens its own slide handle
+    queue = Queue(maxsize=3)  # Buffer up to 3 batches ahead
+    prefetch_thread = Thread(
+        target=prefetch_tiles,
+        args=(wsi_path, tiles, tile_size, batch_size, queue, num_workers),
+        daemon=True,
+    )
+    prefetch_thread.start()
+
     det_count = 0
-    batch_imgs = []
-    batch_infos = []
+    tiles_done = 0
+    pbar = tqdm(total=n_tiles, desc=f"  {slide_name}", leave=False, unit="tile")
 
-    for tile_x, tile_y in tiles:
-        tile_img = read_tile(slide, tile_x, tile_y, tile_size)
-        if tile_img is None:
-            continue
+    while True:
+        item = queue.get()
+        if item is None:
+            break
 
-        batch_imgs.append(tile_img)
-        batch_infos.append((tile_x, tile_y))
-
-        if len(batch_imgs) >= batch_size:
-            results = model.predict(
-                source=batch_imgs,
-                save=False,
-                save_txt=False,
-                save_conf=True,
-                imgsz=imgsz,
-                conf=conf,
-                iou=iou,
-                device=device,
-                half=half,
-                verbose=False,
-            )
-            det_count += save_batch_results(results, batch_infos, labels_dir, tile_size)
-            batch_imgs.clear()
-            batch_infos.clear()
-
-    # Process remaining tiles
-    if batch_imgs:
+        batch_imgs, batch_infos = item
         results = model.predict(
             source=batch_imgs,
             save=False,
@@ -172,8 +189,12 @@ def predict_wsi_onthefly(
             verbose=False,
         )
         det_count += save_batch_results(results, batch_infos, labels_dir, tile_size)
+        tiles_done += len(batch_imgs)
+        pbar.update(len(batch_imgs))
+        pbar.set_postfix(dets=det_count)
 
-    slide.close()
+    pbar.close()
+    prefetch_thread.join()
     return det_count
 
 
@@ -189,27 +210,12 @@ def predict_all_wsis(
     imgsz=1024,
     device="cuda",
     half=True,
-    max_gpu_fraction=0.4,
+    max_gpu_fraction=1.0,
+    num_workers=DEFAULT_NUM_WORKERS,
 ):
-    """Run YOLO on all WSIs, reading tiles on-the-fly with batched inference.
-
-    Args:
-        model_path: Path to YOLO weights.
-        wsi_dir: Directory of WSI files.
-        patches_h5_dir: Directory of trident patches H5 files (with coords).
-        output_dir: Output predictions root directory.
-        tile_size: Tile size for extraction.
-        batch_size: Tiles per YOLO forward pass.
-        conf: Confidence threshold.
-        iou: IoU threshold.
-        imgsz: YOLO input image size.
-        device: Device for inference.
-        half: Use FP16 inference to reduce VRAM.
-        max_gpu_fraction: Max fraction of GPU memory to use (0-1).
-    """
+    """Run YOLO on all WSIs with threaded I/O prefetching."""
     model = YOLO(model_path)
 
-    # Limit GPU memory so other processes can coexist
     if device == "cuda" and max_gpu_fraction < 1.0:
         torch.cuda.set_per_process_memory_fraction(max_gpu_fraction)
         print(f"GPU memory limited to {max_gpu_fraction:.0%} of total")
@@ -228,21 +234,28 @@ def predict_all_wsis(
         if f.endswith("_patches.h5") or f.endswith(".h5")
     ])
 
-    print(f"Found {len(h5_files)} H5 files, {len(wsi_lookup)} WSIs (batch_size={batch_size})")
+    # Pre-filter: separate already-processed from pending
+    pending = []
+    skipped = 0
+    for h5_file in h5_files:
+        h5_stem = h5_file.replace("_patches.h5", "").replace(".h5", "")
+        wsi_output_dir = os.path.join(output_dir, h5_stem)
+        if os.path.exists(os.path.join(wsi_output_dir, "labels")):
+            skipped += 1
+        else:
+            pending.append(h5_file)
+
+    print(f"Found {len(h5_files)} H5 files, {len(wsi_lookup)} WSIs")
+    print(f"Skipping {skipped} already processed, {len(pending)} remaining")
+    print(f"batch_size={batch_size}, num_workers={num_workers}")
 
     total_dets = 0
     processed = 0
-    skipped = 0
     failed = 0
 
-    for h5_file in tqdm(h5_files, desc="YOLO prediction"):
+    for h5_file in tqdm(pending, desc="YOLO prediction"):
         h5_stem = h5_file.replace("_patches.h5", "").replace(".h5", "")
         wsi_output_dir = os.path.join(output_dir, h5_stem)
-
-        # Skip if already processed
-        if os.path.exists(os.path.join(wsi_output_dir, "labels")):
-            skipped += 1
-            continue
 
         # Find matching WSI
         wsi_path = wsi_lookup.get(h5_stem)
@@ -271,6 +284,7 @@ def predict_all_wsis(
                 imgsz=imgsz,
                 device=device,
                 half=half,
+                num_workers=num_workers,
             )
             total_dets += n_dets
             processed += 1
@@ -278,7 +292,6 @@ def predict_all_wsis(
             tqdm.write(f"  ERROR processing {h5_stem}: {e}")
             traceback.print_exc()
             failed += 1
-            # Clean up GPU memory after failure
             torch.cuda.empty_cache()
 
     print(f"\nDone: {processed} processed, {skipped} skipped, {failed} failed, {total_dets} total detections")
@@ -295,14 +308,16 @@ def main():
     parser.add_argument("--model", default=YOLO_WEIGHTS, help="YOLO weights path")
     parser.add_argument("--tile_size", type=int, default=YOLO_TILE_SIZE)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE,
-                        help="Tiles per YOLO forward pass (default: 4)")
+                        help="Tiles per YOLO forward pass (default: 16)")
     parser.add_argument("--conf", type=float, default=0.4)
     parser.add_argument("--iou", type=float, default=0.5)
     parser.add_argument("--imgsz", type=int, default=1024)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no_half", action="store_true", help="Disable FP16 inference")
-    parser.add_argument("--max_gpu_fraction", type=float, default=0.4,
-                        help="Max fraction of GPU memory to use (default: 0.4)")
+    parser.add_argument("--max_gpu_fraction", type=float, default=1.0,
+                        help="Max fraction of GPU memory to use (default: 1.0)")
+    parser.add_argument("--num_workers", type=int, default=DEFAULT_NUM_WORKERS,
+                        help="Threads for tile reading (default: 8)")
     args = parser.parse_args()
 
     predict_all_wsis(
@@ -318,6 +333,7 @@ def main():
         device=args.device,
         half=not args.no_half,
         max_gpu_fraction=args.max_gpu_fraction,
+        num_workers=args.num_workers,
     )
 
 

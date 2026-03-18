@@ -64,6 +64,14 @@ class LVDataset(Dataset):
         row = self.df.iloc[idx]
         h5_path = os.path.join(self.feats_path, row["patient_id"] + ".h5")
 
+        if not os.path.exists(h5_path):
+            # No vessel detections for this patient — return zero features
+            features = torch.zeros(self.num_features, 768)
+            event = torch.tensor(row["os"], dtype=torch.float32)
+            time = torch.tensor(row["time"], dtype=torch.float32)
+            lvi = torch.tensor(row["lvi"], dtype=torch.float32)
+            return features, event, time, lvi
+
         with h5py.File(h5_path, "r") as f:
             features = torch.from_numpy(f["features"][:])
             # Load confidences if available (for weighted sampling)
@@ -125,16 +133,16 @@ def _worker_init_fn(worker_id):
     np.random.seed(SEED + worker_id)
 
 
-def create_dataloaders(df, feats_path=EMORY_FEATS_PATH):
+def create_dataloaders(df, feats_path=EMORY_FEATS_PATH, num_features=NUM_FEATURES):
     """Create train, val, and test DataLoaders for Emory data."""
     train_loader = DataLoader(
-        LVDataset(feats_path, df, "train"),
+        LVDataset(feats_path, df, "train", num_features=num_features),
         batch_size=BATCH_SIZE,
         shuffle=True,
         worker_init_fn=_worker_init_fn,
     )
     val_loader = DataLoader(
-        LVDataset(feats_path, df, "val"),
+        LVDataset(feats_path, df, "val", num_features=num_features),
         batch_size=BATCH_SIZE,
         shuffle=False,
         worker_init_fn=_worker_init_fn,

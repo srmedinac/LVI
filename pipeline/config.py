@@ -11,8 +11,7 @@ CLINICAL_CSV = os.path.join(PROJECT_ROOT, "clinical_data_emory_mibc_lvi_os.csv")
 
 EMORY_FEATS_PATH = os.path.join(
     PROJECT_ROOT,
-    "trident_outputs/emory_mibc/20x_512px_0px_overlap/"
-    "late_fusion_patient_level_conch_v15_LVI",
+    "results_2026/patient_features/emory",
 )
 
 TCGA_FEATS_PATH = os.path.join(
@@ -22,7 +21,7 @@ TCGA_FEATS_PATH = os.path.join(
 
 TCGA_FILTERED_FEATS_PATH = os.path.join(
     PROJECT_ROOT,
-    "trident_outputs/mibc_TCGA/20x_512px_0px_overlap/filtered_conch_v15_LVI",
+    "results_2026/filtered_features/tcga",
 )
 
 TCGA_PATCHES_H5_PATH = os.path.join(
@@ -56,7 +55,7 @@ EMORY_FILTERED_SLIDE_FEATS_PATH = os.path.join(
 
 TCGA_YOLO_PREDICTIONS_PATH = os.path.join(
     PROJECT_ROOT,
-    "trident_outputs/mibc_TCGA/20x_512px_0px_overlap/yolo_predictions",
+    "results_2026/yolo_predictions/tcga",
 )
 
 YOLO_WEIGHTS = os.path.join(
@@ -67,8 +66,8 @@ YOLO_WEIGHTS = os.path.join(
 YOLO_TILE_SIZE = 2048        # Tile size used for YOLO prediction
 
 # ── Output paths ──────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "pipeline/checkpoints")
-RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
+CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "results_2026/checkpoints")
+RESULTS_DIR = os.path.join(PROJECT_ROOT, "results_2026/results")
 
 # ── Device ────────────────────────────────────────────────────────────────────
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,28 +80,28 @@ INPUT_FEATURE_DIM = 768      # CONCH v1.5 embedding dimension
 N_HEADS = 4                  # ABMIL attention heads
 HEAD_DIM = 512               # ABMIL head dimension
 MHA_NUM_HEADS = 8            # Multi-head attention heads (LVI patch attention)
-HIDDEN_DIM = 256             # Shared hidden layer dimension
-DROPOUT = 0.2
+HIDDEN_DIM = 128             # Shared hidden layer dimension (tuned down from 256)
+DROPOUT = 0.7                # Tuned up from 0.2 — key for small dataset
 GATED = True
 
 # ── Training ──────────────────────────────────────────────────────────────────
 BATCH_SIZE = 64
 NUM_FEATURES = 512           # Patches sampled per slide during training
 LR = 2e-4
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 1e-3          # Tuned up from 1e-4
 GRAD_CLIP = 1.0
 
 # Joint model
-JOINT_EPOCHS = 60
-JOINT_PATIENCE = 10
+JOINT_EPOCHS = 80
+JOINT_PATIENCE = 15
 COX_WEIGHT = 1.0
-LVI_WEIGHT = 1.0
-SPARSITY_WEIGHT = 0.1
+LVI_WEIGHT = 0.5             # Tuned down from 1.0
+SPARSITY_WEIGHT = 0.0        # Tuned — not useful
 CONSISTENCY_WEIGHT = 0.3
 CONSISTENCY_SCALE = 0.05     # Multiplied with CONSISTENCY_WEIGHT
 
 # Ablation models
-ABLATION_EPOCHS = 30
+ABLATION_EPOCHS = 60         # More epochs with cosine schedule
 
 # Scheduler
 SCHEDULER_PATIENCE = 5
