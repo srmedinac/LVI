@@ -48,9 +48,23 @@ Two ablation models (survival-only, LVI-only) isolate each task's contribution.
 | Loss | Weight | Description |
 |------|--------|-------------|
 | Cox partial log-likelihood | 1.0 | Survival prediction via `torchsurv` |
-| Binary cross-entropy | 1.0 | Patient-level LVI classification |
-| Sparsity (entropy) | 0.1 | Encourages sparse patch-level LVI attention |
+| Binary cross-entropy | 0.5 | Patient-level LVI classification |
+| Sparsity (entropy) | 0.0 | Disabled after tuning |
 | Consistency (L1) | 0.015 | Aligns normalized risk score with LVI probability |
+
+### Analysis Scripts
+
+```
+results_2026/results/
+├── km_plots.R              # Emory KM curves (main + ablation)
+├── km_optimal.R            # Emory KM with 35th pct cutpoint + MVA forest plot
+├── km_tcga.R               # TCGA KM curves + MVA
+├── subgroup_km.R           # Emory subgroup analyses (LVI-/+, pT, NAC)
+├── subgroup_staging.R      # pT3-4, N+/N0 subgroups (Emory + TCGA)
+├── mva_forest.R            # Multivariable Cox + forest plots
+├── extra_analyses.py       # Attention violin plots + t-SNE
+├── rna_angiogenesis.py     # Bulk RNA angiogenesis correlation (TCGA)
+```
 
 ## Workflow
 
@@ -124,17 +138,44 @@ Exports `survival_data_for_R.csv` and `clinical_merged_{emory,tcga}_final.csv` f
 python -m pipeline.heatmaps --slide_path /path/to/slide.ndpi
 ```
 
+## Results
+
+### Emory Test Set (n=82)
+
+| Analysis | HR (95% CI) | p-value | C-index |
+|----------|-------------|---------|---------|
+| Univariable | 4.42 (1.54–12.67) | 0.006 | 0.641 |
+| Multivariable* | 4.16 (1.24–13.90) | 0.021 | 0.752 |
+
+*Adjusted for pT stage, pN status, LVI, age, sex, NAC
+
+**Key subgroup**: LVI-negative patients (n=52): HR=3.68, p=0.034 — model identifies high-risk patients even when pathologist-assessed LVI is absent.
+
+### TCGA External Validation (n=265)
+
+| Analysis | HR (95% CI) | p-value | C-index |
+|----------|-------------|---------|---------|
+| Univariable | 1.78 (1.24–2.54) | 0.002 | 0.609 |
+| Multivariable* | 1.46 (1.01–2.10) | 0.044 | 0.646 |
+
+*Adjusted for AJCC stage, age, sex
+
+**Ablation study**: Joint model (C=0.609) outperforms Survival-Only (C=0.569, p=0.068) and LVI-Only (C=0.516, p=0.90).
+
+**RNA correlation**: High AI risk associated with higher angiogenesis gene expression (p=0.016).
+
 ## Data
 
 | Cohort | Patients | Slides | LVI+ | OS Events |
 |--------|----------|--------|------|-----------|
-| Emory (train) | 81 | — | — | — |
-| Emory (test) | 82 | — | 54 total | 73 total |
-| TCGA-BLCA | 53 | — | N/A | — |
+| Emory (train) | 81 | 152 | 27 | 36 |
+| Emory (test) | 82 | 152 | 27 | 37 |
+| TCGA-BLCA | 265 | 352 | N/A | 137 |
 
 - **Features**: 768-dim CONCH v1.5 embeddings extracted at 20× magnification, 512px patches
 - **Sampling**: 512 patches per patient during training (multinomial by YOLO confidence)
 - **Censoring**: 5-year (1825 days)
+- **Risk cutpoint**: 35th percentile of training set risk scores
 
 ## Dependencies
 

@@ -11,8 +11,17 @@ yolo_lvi/
 pipeline/checkpoints/*.pth
 *.pt
 
-# Results (generated)
-results/
+# Results (old, top-level only)
+/results/
+
+# Results 2026 (keep scripts, ignore data/images)
+results_2026/checkpoints/
+results_2026/patient_features/
+results_2026/filtered_features/
+results_2026/yolo_predictions/
+results_2026/results/*.csv
+results_2026/results/*.png
+results_2026/*.csv
 
 # Python
 __pycache__/
