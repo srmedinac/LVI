@@ -64,6 +64,8 @@ mibc_emory_lv/
 
 # Generated images (can regenerate)
 *.png
+# But keep figures/ for README
+!figures/*.png
 
 # PDFs
 *.pdf

@@ -1,9 +1,13 @@
-"""LVI attention heatmap visualization.
+"""Multi-panel LVI attention heatmap visualization.
 
-Creates blended heatmap overlays on WSI showing:
-  - ABMIL attention across ALL tissue patches (vessel-adjacent patches highlighted)
-  - YOLO vessel detection bounding boxes (optional)
-  - Top-k most attended patches saved as crops
+Creates a publication/presentation-quality figure showing the model's
+decision layers side by side:
+  A. H&E tissue overview
+  B. YOLO vessel detections (green bounding boxes)
+  C. Patch-level LVI probability (from MHA + MLP head)
+  D. ABMIL slide-level attention (rank-normalized, vessel patches only)
+
+Plus an optional top-k strip showing the highest-attention patch crops.
 
 Usage:
     python -m pipeline.visualize --patient_id 577-3428
@@ -18,6 +22,9 @@ import os
 import cv2
 import h5py
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import Normalize
+from matplotlib.patches import Rectangle
 import numpy as np
 import openslide
 import torch
@@ -37,10 +44,12 @@ from pipeline.preprocess.filter_h5 import (
 from pipeline.train import set_seed
 
 FILTERED_FEATS = "trident_outputs/emory_mibc/20x_512px_0px_overlap/filtered_conch_v15_LVI"
-PATCH_SIZE_20X = 512   # patch size at 20x magnification
-PATCH_SIZE_LVL0 = 1024  # patch size at level 0 (40x native → 512 at 20x = 1024 at 40x)
-VIS_LEVEL = 4     # 16x downsample — good balance of detail vs speed
+PATCH_SIZE_20X = 512
+PATCH_SIZE_LVL0 = 1024
+VIS_LEVEL = 4
 
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def find_slide_path(slide_name, wsi_dir=EMORY_WSI_DIR):
     """Find the WSI file for a given slide name."""
@@ -80,38 +89,40 @@ def load_yolo_boxes(slide_name, yolo_dir=EMORY_YOLO_PREDICTIONS_PATH):
 
 
 def run_model_on_features(model, features):
-    """Run Joint model on features, return ABMIL attention weights."""
+    """Run Joint model on features, return ABMIL attention + patch LVI probs."""
     model.eval()
     with torch.no_grad():
         feat_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-        risk_score, lvi_logit, main_attn, _, _ = model(
+        risk_score, lvi_logit, main_attn, patch_lvi_logits, _ = model(
             {"features": feat_tensor},
             return_raw_attention=True,
             return_patch_predictions=True,
         )
 
-    # main_attn: (1, 1, n_heads, n_patches) — average heads, softmax
+    # ABMIL attention: (1, 1, n_heads, n_patches) → average heads → softmax
     attn_raw = main_attn.squeeze(0).squeeze(0)  # (n_heads, n_patches)
-    attn_avg = attn_raw.mean(dim=0)             # (n_patches,)
+    attn_avg = attn_raw.mean(dim=0)
     abmil_attn = torch.softmax(attn_avg, dim=0).cpu().numpy()
+
+    # Patch LVI probabilities
+    patch_lvi_probs = torch.sigmoid(patch_lvi_logits.squeeze(0).squeeze(-1)).cpu().numpy()
 
     risk = risk_score.item()
     lvi_prob = torch.sigmoid(lvi_logit).item()
-    return abmil_attn, risk, lvi_prob
+    return abmil_attn, patch_lvi_probs, risk, lvi_prob
 
 
 def create_overlay(scores, coords, patch_size_level0, scale, region_size):
-    """Create pixel-level heatmap overlay (trident-style, vectorized)."""
+    """Create pixel-level heatmap overlay."""
     pw = int(np.ceil(patch_size_level0 * scale[0]))
     ph = int(np.ceil(patch_size_level0 * scale[1]))
-    h, w = region_size[1], region_size[0]  # region_size is (w, h)
+    h, w = region_size[1], region_size[0]
 
     coords_scaled = np.ceil(coords * scale).astype(int)
 
     overlay = np.full((h, w), np.nan, dtype=np.float32)
     counter = np.zeros((h, w), dtype=np.uint16)
 
-    # Vectorized: compute all patch bounds at once, then fill
     x_starts = coords_scaled[:, 0]
     y_starts = coords_scaled[:, 1]
     x_ends = np.minimum(x_starts + pw, w)
@@ -125,32 +136,57 @@ def create_overlay(scores, coords, patch_size_level0, scale, region_size):
         mask = counter[ys:ye, xs:xe] == 0
         overlay[ys:ye, xs:xe] = np.where(
             mask, scores[idx],
-            (overlay[ys:ye, xs:xe] * counter[ys:ye, xs:xe] + scores[idx]) / (counter[ys:ye, xs:xe] + 1)
+            (overlay[ys:ye, xs:xe] * counter[ys:ye, xs:xe] + scores[idx])
+            / (counter[ys:ye, xs:xe] + 1)
         )
         counter[ys:ye, xs:xe] += 1
 
     return overlay
 
 
+def blend_overlay(wsi_img, overlay, cmap_name, alpha=0.5, blur_sigma=3.0,
+                  vmin=0.0, vmax=1.0):
+    """Apply colormap to overlay and blend with WSI image."""
+    nan_mask = np.isnan(overlay)
+    overlay_smooth = overlay.copy()
+    overlay_smooth[nan_mask] = 0
+    if blur_sigma > 0:
+        overlay_smooth = gaussian_filter(overlay_smooth, sigma=blur_sigma)
+    overlay_smooth[nan_mask] = np.nan
+
+    # Normalize to [0, 1] for colormap
+    norm = Normalize(vmin=vmin, vmax=vmax, clip=True)
+    normalized = norm(overlay_smooth)
+
+    cmap_fn = plt.get_cmap(cmap_name)
+    overlay_colored = np.zeros((*overlay_smooth.shape, 3), dtype=np.uint8)
+    valid_mask = ~np.isnan(overlay_smooth)
+    colored_valid = (cmap_fn(normalized[valid_mask]) * 255).astype(np.uint8)[:, :3]
+    overlay_colored[valid_mask] = colored_valid
+
+    blended = cv2.addWeighted(wsi_img, 1.0 - alpha, overlay_colored, alpha, 0)
+    blended[nan_mask] = wsi_img[nan_mask]
+    return blended
+
+
+# ── Multi-panel heatmap ─────────────────────────────────────────────────────
+
 def generate_heatmap(
     slide_name,
     model,
     output_dir,
     vis_level=VIS_LEVEL,
-    cmap="coolwarm",
-    alpha=0.45,
-    blur_sigma=5.0,
-    show_yolo_boxes=False,
+    alpha=0.5,
+    blur_sigma=3.0,
     save_topk=0,
-    yolo_box_color=(0, 255, 0),
-    yolo_box_thickness=3,
 ):
-    """Generate a blended heatmap overlay for one slide.
+    """Generate a multi-panel heatmap figure for one slide.
 
-    All tissue patches get a score:
-      - Filtered (vessel-adjacent) patches: ABMIL attention from model
-      - Non-filtered patches: fixed low value (background tissue)
-    Scores are rank-normalized, blended onto the WSI, with optional YOLO boxes.
+    Panels:
+      A. H&E overview
+      B. YOLO vessel detections
+      C. Patch-level LVI probability
+      D. ABMIL attention (vessel patches)
     """
 
     # 1. Find and open WSI
@@ -160,16 +196,20 @@ def generate_heatmap(
         return None
 
     wsi = openslide.OpenSlide(slide_path)
-    level_dims = wsi.level_dimensions
-    level_downsamples = wsi.level_downsamples
-
-    # Clamp vis_level
     vis_level = min(vis_level, wsi.level_count - 1)
-    downsample = level_downsamples[vis_level]
+    downsample = wsi.level_downsamples[vis_level]
     scale = np.array([1.0 / downsample, 1.0 / downsample])
-    region_size = tuple((np.array(level_dims[0]) * scale).astype(int))
+    region_size = tuple((np.array(wsi.level_dimensions[0]) * scale).astype(int))
 
-    # 2. Load ALL patch coords from the original (unfiltered) slide H5
+    native_mag = int(wsi.properties.get("openslide.objective-power", 40))
+    patch_size_lvl0 = PATCH_SIZE_20X * (native_mag // 20)
+
+    # 2. Read WSI thumbnail
+    img = wsi.read_region((0, 0), vis_level, wsi.level_dimensions[vis_level]).convert("RGB")
+    img = img.resize(region_size, resample=Image.Resampling.BICUBIC)
+    wsi_img = np.array(img)
+
+    # 3. Load ALL patch coords
     orig_h5 = os.path.join(EMORY_SLIDE_FEATS_PATH, f"{slide_name}.h5")
     if not os.path.exists(orig_h5):
         print(f"  Original H5 not found: {orig_h5}")
@@ -177,9 +217,9 @@ def generate_heatmap(
         return None
 
     with h5py.File(orig_h5, "r") as f:
-        all_coords = f["coords"][:]  # (N_total, 2)
+        all_coords = f["coords"][:]
 
-    # 3. Load filtered (vessel-adjacent) features + coords
+    # 4. Load filtered features + coords
     filt_h5 = os.path.join(FILTERED_FEATS, f"{slide_name}.h5")
     has_filtered = os.path.exists(filt_h5)
 
@@ -188,134 +228,183 @@ def generate_heatmap(
             filt_features = f["features"][:]
             filt_coords = f["coords"][:]
 
-        # 4. Run model on filtered features
-        abmil_attn, risk, lvi_prob = run_model_on_features(model, filt_features)
-
-        # 5. Map filtered attention back to all-patch indices
-        # Build lookup: (x, y) → attention score
-        filt_coord_set = {}
-        for i, (fc) in enumerate(filt_coords):
-            filt_coord_set[(int(fc[0]), int(fc[1]))] = abmil_attn[i]
-
-        # Assign scores: filtered patches get attention, others get 0
-        all_scores = np.zeros(len(all_coords), dtype=float)
-        for i, coord in enumerate(all_coords):
-            key = (int(coord[0]), int(coord[1]))
-            if key in filt_coord_set:
-                all_scores[i] = filt_coord_set[key]
-
+        abmil_attn, patch_lvi_probs, risk, lvi_prob = run_model_on_features(
+            model, filt_features
+        )
         n_filtered = len(filt_coords)
+
+        # Build coord → score lookups
+        filt_attn_map = {}
+        filt_lvi_map = {}
+        for i, fc in enumerate(filt_coords):
+            key = (int(fc[0]), int(fc[1]))
+            filt_attn_map[key] = abmil_attn[i]
+            filt_lvi_map[key] = patch_lvi_probs[i]
     else:
-        all_scores = np.zeros(len(all_coords), dtype=float)
         risk, lvi_prob = 0.0, 0.0
         n_filtered = 0
+        filt_attn_map = {}
+        filt_lvi_map = {}
+        abmil_attn = np.array([])
+        filt_coords = np.empty((0, 2))
 
-    # 6. Score normalization
-    # Rank-normalize vessel patches independently so there's contrast within them,
-    # then place them in the upper score range [0.5, 1.0].
-    # Non-vessel tissue patches get a flat low value.
-    non_vessel_mask = all_scores == 0
+    # 5. Load YOLO boxes
+    yolo_boxes, yolo_confs = load_yolo_boxes(slide_name)
 
-    vessel_scores = all_scores[~non_vessel_mask]
-    if len(vessel_scores) > 0:
-        vessel_ranked = rankdata(vessel_scores, method="average") / len(vessel_scores)
-        all_scores[~non_vessel_mask] = 0.5 + 0.5 * vessel_ranked
+    # 6. Build score arrays for all patches
+    # ABMIL attention: vessel patches get rank-normalized [0.5, 1.0], others get 0.15
+    attn_scores = np.zeros(len(all_coords), dtype=float)
+    for i, coord in enumerate(all_coords):
+        key = (int(coord[0]), int(coord[1]))
+        if key in filt_attn_map:
+            attn_scores[i] = filt_attn_map[key]
 
-    all_scores[non_vessel_mask] = 0.15  # cool blue for background tissue
+    vessel_mask = attn_scores > 0
+    if vessel_mask.sum() > 0:
+        vessel_ranked = rankdata(attn_scores[vessel_mask], method="average") / vessel_mask.sum()
+        attn_scores[vessel_mask] = 0.5 + 0.5 * vessel_ranked
+    attn_scores[~vessel_mask] = 0.15
 
-    ranked = all_scores
+    # LVI probability: vessel patches get their prob, others get 0
+    lvi_scores = np.zeros(len(all_coords), dtype=float)
+    for i, coord in enumerate(all_coords):
+        key = (int(coord[0]), int(coord[1]))
+        if key in filt_lvi_map:
+            lvi_scores[i] = filt_lvi_map[key]
 
-    # 7. Create pixel-level overlay
-    # Determine patch size at level 0 from WSI magnification
-    native_mag = int(wsi.properties.get("openslide.objective-power", 40))
-    patch_size_lvl0 = PATCH_SIZE_20X * (native_mag // 20)
+    # 7. Create overlays
+    attn_overlay = create_overlay(attn_scores, all_coords, patch_size_lvl0, scale, region_size)
+    lvi_overlay = create_overlay(lvi_scores, all_coords, patch_size_lvl0, scale, region_size)
 
-    overlay = create_overlay(ranked, all_coords, patch_size_lvl0, scale, region_size)
+    # 8. Blend overlays
+    attn_blended = blend_overlay(wsi_img.copy(), attn_overlay, "coolwarm",
+                                 alpha=alpha, blur_sigma=blur_sigma)
+    lvi_blended = blend_overlay(wsi_img.copy(), lvi_overlay, "Reds",
+                                alpha=alpha, blur_sigma=blur_sigma)
 
-    # 8. Smooth the overlay to reduce patchiness
-    # Replace NaN temporarily for filtering
-    nan_mask = np.isnan(overlay)
-    overlay_smooth = overlay.copy()
-    overlay_smooth[nan_mask] = 0
-    overlay_smooth = gaussian_filter(overlay_smooth, sigma=blur_sigma)
-    # Restore NaN outside tissue
-    overlay_smooth[nan_mask] = np.nan
+    # 9. YOLO boxes panel
+    yolo_panel = wsi_img.copy()
+    if len(yolo_boxes) > 0:
+        for box in yolo_boxes:
+            x1, y1, x2, y2 = (box * scale[0]).astype(int)
+            cv2.rectangle(yolo_panel, (x1, y1), (x2, y2), (0, 200, 0), 2)
 
-    # 9. Apply colormap
-    cmap_fn = plt.get_cmap(cmap)
-    overlay_colored = np.zeros((*overlay_smooth.shape, 3), dtype=np.uint8)
-    valid_mask = ~np.isnan(overlay_smooth)
-    colored_valid = (cmap_fn(overlay_smooth[valid_mask]) * 255).astype(np.uint8)[:, :3]
-    overlay_colored[valid_mask] = colored_valid
-
-    # 10. Read WSI region and blend
-    img = wsi.read_region((0, 0), vis_level, level_dims[vis_level]).convert("RGB")
-    img = img.resize(region_size, resample=Image.Resampling.BICUBIC)
-    img = np.array(img)
-
-    blended = cv2.addWeighted(img, 1.0 - alpha, overlay_colored, alpha, 0)
-
-    # Restore original tissue where there's no heatmap data (NaN regions)
-    blended[nan_mask] = img[nan_mask]
-
-    # 11. Draw YOLO boxes
-    yolo_boxes = np.empty((0, 4))
-    if show_yolo_boxes:
-        yolo_boxes, _ = load_yolo_boxes(slide_name)
-        if len(yolo_boxes) > 0:
-            for box in yolo_boxes:
-                x1, y1, x2, y2 = (box * scale[0]).astype(int)
-                cv2.rectangle(blended, (x1, y1), (x2, y2),
-                              yolo_box_color, yolo_box_thickness)
-
-    # 12. Add info text
-    info_text = f"Risk: {risk:.2f} | LVI Prob: {lvi_prob:.3f} | Vessel Patches: {n_filtered}/{len(all_coords)} | YOLO Boxes: {len(yolo_boxes)}"
-    cv2.putText(blended, info_text, (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 3)
-    cv2.putText(blended, info_text, (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1)
-
-    # 13. Save
-    os.makedirs(output_dir, exist_ok=True)
-    clean_name = slide_name.replace(" ", "_").replace(":", "-")
-    out_path = os.path.join(output_dir, f"heatmap_{clean_name}.png")
-    Image.fromarray(blended).save(out_path)
-
-    print(f"  {slide_name}")
-    print(f"    Patches: {n_filtered}/{len(all_coords)} vessel-adjacent")
-    print(f"    Risk: {risk:.3f}, LVI Prob: {lvi_prob:.3f}")
-    print(f"    YOLO boxes: {len(yolo_boxes)}")
-    print(f"    Saved: {out_path}")
-
-    # 14. Save top-k patches
+    # 10. Top-k patch crops
+    topk_crops = []
     if save_topk > 0 and has_filtered:
-        topk_dir = os.path.join(output_dir, f"topk_{clean_name}")
-        os.makedirs(topk_dir, exist_ok=True)
         topk_indices = np.argsort(abmil_attn)[-save_topk:][::-1]
         for rank, idx in enumerate(topk_indices):
             x, y = int(filt_coords[idx][0]), int(filt_coords[idx][1])
             patch = wsi.read_region((x, y), 0, (patch_size_lvl0, patch_size_lvl0)).convert("RGB")
+            topk_crops.append((np.array(patch), abmil_attn[idx], patch_lvi_probs[idx]))
+
+            # Also save individually
+            topk_dir = os.path.join(output_dir, f"topk_{slide_name.replace(' ', '_')}")
+            os.makedirs(topk_dir, exist_ok=True)
             patch.save(os.path.join(
                 topk_dir,
-                f"rank{rank+1}_attn{abmil_attn[idx]:.4f}_x{x}_y{y}.png"
+                f"rank{rank+1}_attn{abmil_attn[idx]:.4f}_lvi{patch_lvi_probs[idx]:.3f}_x{x}_y{y}.png"
             ))
-        print(f"    Top-{save_topk} patches saved to: {topk_dir}")
 
     wsi.close()
+
+    # ── Build the figure ─────────────────────────────────────────────────────
+
+    has_topk = len(topk_crops) > 0
+    height_ratios = [1, 0.25] if has_topk else [1]
+    nrows = 2 if has_topk else 1
+
+    fig = plt.figure(figsize=(22, 6.5 * nrows), facecolor="white", dpi=150)
+    gs = gridspec.GridSpec(nrows, 4, figure=fig, height_ratios=height_ratios,
+                           hspace=0.15, wspace=0.05)
+
+    panels = [
+        (wsi_img, "A. H&E Overview", None, None),
+        (yolo_panel, f"B. YOLO Detections (n={len(yolo_boxes)})", None, None),
+        (lvi_blended, "C. Patch LVI Probability", "Reds", (0, 1)),
+        (attn_blended, "D. ABMIL Attention", "coolwarm", (0, 1)),
+    ]
+
+    panel_axes = []
+    for col, (img_data, title, cmap_name, clim) in enumerate(panels):
+        ax = fig.add_subplot(gs[0, col])
+        ax.imshow(img_data)
+        ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.5)
+            spine.set_color("#cccccc")
+
+        if cmap_name and clim:
+            sm = plt.cm.ScalarMappable(cmap=plt.get_cmap(cmap_name),
+                                       norm=Normalize(vmin=clim[0], vmax=clim[1]))
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax, fraction=0.03, pad=0.02, shrink=0.6)
+            cbar.ax.tick_params(labelsize=8)
+
+        panel_axes.append(ax)
+
+    # Top-k strip
+    if has_topk:
+        n_crops = len(topk_crops)
+        for i, (crop, attn_val, lvi_val) in enumerate(topk_crops):
+            ax = fig.add_subplot(gs[1, :], frameon=False)
+            ax.set_visible(False)
+
+        # Use a sub-gridspec for the crops
+        gs_crops = gridspec.GridSpecFromSubplotSpec(
+            1, n_crops, subplot_spec=gs[1, :], wspace=0.08
+        )
+        for i, (crop, attn_val, lvi_val) in enumerate(topk_crops):
+            ax = fig.add_subplot(gs_crops[0, i])
+            ax.imshow(crop)
+            ax.set_title(f"#{i+1}\nattn={attn_val:.3f} | LVI={lvi_val:.2f}",
+                         fontsize=9, fontweight="bold", pad=4)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.5)
+                spine.set_color("#e74c3c" if lvi_val > 0.5 else "#3498db")
+
+    # Suptitle with patient info
+    patient_id = slide_name.split("_")[0] if "_" in slide_name else slide_name
+    risk_label = "High" if risk > -2.7603 else "Low"
+    lvi_label = f"LVI Prob: {lvi_prob:.3f}"
+
+    fig.suptitle(
+        f"Patient {patient_id}  |  Risk: {risk:.2f} ({risk_label})  |  "
+        f"{lvi_label}  |  Vessel Patches: {n_filtered}/{len(all_coords)}  |  "
+        f"YOLO Boxes: {len(yolo_boxes)}",
+        fontsize=12, fontweight="bold", y=1.01, color="#2c3e50",
+    )
+
+    # Save
+    os.makedirs(output_dir, exist_ok=True)
+    clean_name = slide_name.replace(" ", "_").replace(":", "-")
+    out_path = os.path.join(output_dir, f"heatmap_{clean_name}.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white",
+                pad_inches=0.3)
+    plt.close()
+
+    print(f"  {slide_name}")
+    print(f"    Patches: {n_filtered}/{len(all_coords)} vessel-adjacent")
+    print(f"    Risk: {risk:.3f} ({risk_label}), LVI Prob: {lvi_prob:.3f}")
+    print(f"    YOLO boxes: {len(yolo_boxes)}")
+    print(f"    Saved: {out_path}")
+
     return out_path
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate LVI attention heatmaps")
+    parser = argparse.ArgumentParser(description="Generate multi-panel LVI attention heatmaps")
     parser.add_argument("--slide_name", help="Exact slide name (without extension)")
     parser.add_argument("--patient_id", help="Patient ID (generates for all slides)")
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--vis_level", type=int, default=VIS_LEVEL)
-    parser.add_argument("--cmap", default="coolwarm")
-    parser.add_argument("--alpha", type=float, default=0.45, help="Heatmap blend alpha")
-    parser.add_argument("--blur", type=float, default=5.0, help="Gaussian blur sigma")
-    parser.add_argument("--save_topk", type=int, default=0, help="Save top-k attended patches")
-    parser.add_argument("--yolo_boxes", action="store_true", help="Show YOLO detection boxes")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Heatmap blend alpha")
+    parser.add_argument("--blur", type=float, default=3.0, help="Gaussian blur sigma")
+    parser.add_argument("--save_topk", type=int, default=5, help="Save top-k attended patches (0 to skip)")
     args = parser.parse_args()
 
     set_seed()
@@ -332,10 +421,8 @@ def main():
     if args.slide_name:
         generate_heatmap(
             args.slide_name, model, output_dir,
-            vis_level=args.vis_level, cmap=args.cmap,
-            alpha=args.alpha, blur_sigma=args.blur,
-            show_yolo_boxes=args.yolo_boxes,
-            save_topk=args.save_topk,
+            vis_level=args.vis_level, alpha=args.alpha,
+            blur_sigma=args.blur, save_topk=args.save_topk,
         )
     elif args.patient_id:
         pattern = os.path.join(FILTERED_FEATS, f"{args.patient_id}*.h5")
@@ -347,10 +434,8 @@ def main():
             slide_name = os.path.basename(h5_path).replace(".h5", "")
             generate_heatmap(
                 slide_name, model, output_dir,
-                vis_level=args.vis_level, cmap=args.cmap,
-                alpha=args.alpha, blur_sigma=args.blur,
-                show_yolo_boxes=args.yolo_boxes,
-                save_topk=args.save_topk,
+                vis_level=args.vis_level, alpha=args.alpha,
+                blur_sigma=args.blur, save_topk=args.save_topk,
             )
     else:
         parser.error("Provide --slide_name or --patient_id")

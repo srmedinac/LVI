@@ -23,7 +23,8 @@ pipeline/
 ├── evaluate.py               # C-index, AUC, Kaplan-Meier, ROC curves
 ├── inference_tcga.py         # External validation on TCGA-BLCA
 ├── export_for_r.py           # Export predictions for R survival analysis
-├── heatmaps.py               # ABMIL attention heatmap visualization
+├── heatmaps.py               # ABMIL attention heatmap visualization (trident)
+├── visualize.py              # Multi-panel attention heatmap visualization
 └── preprocess/
     ├── yolo_predict.py       # On-the-fly YOLO inference on WSI tiles
     ├── filter_h5.py          # Filter CONCH features by YOLO detections
@@ -65,6 +66,60 @@ results_2026/results/
 ├── extra_analyses.py       # Attention violin plots + t-SNE
 ├── rna_angiogenesis.py     # Bulk RNA angiogenesis correlation (TCGA)
 ```
+
+## Results
+
+### Emory Test Set (n=82)
+
+| Analysis | HR (95% CI) | p-value | C-index |
+|----------|-------------|---------|---------|
+| Univariable | 4.42 (1.54–12.67) | 0.006 | 0.641 |
+| Multivariable* | 4.16 (1.24–13.90) | 0.021 | 0.752 |
+
+*Adjusted for pT stage, pN status, LVI, age, sex, NAC
+
+![Emory Kaplan-Meier](figures/km_emory_test_35pct.png)
+
+**Key subgroup**: LVI-negative patients (n=52): HR=3.68, p=0.034 — model identifies high-risk patients even when pathologist-assessed LVI is absent.
+
+![LVI-Negative Subgroup](figures/km_subgroup_lvi_negative.png)
+
+### TCGA External Validation (n=265)
+
+| Analysis | HR (95% CI) | p-value | C-index |
+|----------|-------------|---------|---------|
+| Univariable | 1.78 (1.24–2.54) | 0.002 | 0.609 |
+| Multivariable* | 1.46 (1.01–2.10) | 0.044 | 0.646 |
+
+*Adjusted for AJCC stage, age, sex
+
+![TCGA Kaplan-Meier](figures/km_tcga_joint_35pct.png)
+
+**Ablation study**: Joint model (C=0.609) outperforms Survival-Only (C=0.569, p=0.068) and LVI-Only (C=0.516, p=0.90).
+
+### LVI Classification
+
+![LVI ROC Curve](figures/roc_joint_test.png)
+
+AUC = 0.753 on the Emory test set.
+
+### Multivariable Analysis
+
+![Forest Plot](figures/forest_mva_35pct.png)
+
+AI risk group remains significant (HR=4.16, p=0.021) after adjusting for pT stage, pN status, LVI, age, sex, and neoadjuvant chemotherapy.
+
+### Attention Analysis
+
+![Attention Violins](figures/attention_violins.png)
+
+High-risk patients show higher max attention weights and more concentrated attention (lower entropy), consistent with the model focusing on specific vessel-adjacent regions.
+
+### RNA Angiogenesis Correlation (TCGA)
+
+![RNA Angiogenesis](figures/rna_angiogenesis_tcga.png)
+
+High AI risk associated with higher angiogenesis gene expression (p=0.016), providing biological validation that the model captures vascular biology.
 
 ## Workflow
 
@@ -135,34 +190,16 @@ Exports `survival_data_for_R.csv` and `clinical_merged_{emory,tcga}_final.csv` f
 ### 6. Attention Heatmaps
 
 ```bash
-python -m pipeline.heatmaps --slide_path /path/to/slide.ndpi
+# Multi-panel heatmap (H&E + YOLO boxes + LVI probability + ABMIL attention + top-k patches)
+python -m pipeline.visualize --patient_id 577-3428
+
+# With top-k patch crops saved separately
+python -m pipeline.visualize --patient_id 577-3428 --save_topk 5
 ```
 
-## Results
+![Heatmap Example](figures/heatmap_example.png)
 
-### Emory Test Set (n=82)
-
-| Analysis | HR (95% CI) | p-value | C-index |
-|----------|-------------|---------|---------|
-| Univariable | 4.42 (1.54–12.67) | 0.006 | 0.641 |
-| Multivariable* | 4.16 (1.24–13.90) | 0.021 | 0.752 |
-
-*Adjusted for pT stage, pN status, LVI, age, sex, NAC
-
-**Key subgroup**: LVI-negative patients (n=52): HR=3.68, p=0.034 — model identifies high-risk patients even when pathologist-assessed LVI is absent.
-
-### TCGA External Validation (n=265)
-
-| Analysis | HR (95% CI) | p-value | C-index |
-|----------|-------------|---------|---------|
-| Univariable | 1.78 (1.24–2.54) | 0.002 | 0.609 |
-| Multivariable* | 1.46 (1.01–2.10) | 0.044 | 0.646 |
-
-*Adjusted for AJCC stage, age, sex
-
-**Ablation study**: Joint model (C=0.609) outperforms Survival-Only (C=0.569, p=0.068) and LVI-Only (C=0.516, p=0.90).
-
-**RNA correlation**: High AI risk associated with higher angiogenesis gene expression (p=0.016).
+Multi-panel visualization showing each layer of the model's decision process: raw H&E tissue, YOLO vessel detections, per-patch LVI probability from the MHA head, and ABMIL slide-level attention.
 
 ## Data
 
