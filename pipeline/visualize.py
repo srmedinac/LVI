@@ -180,6 +180,7 @@ def generate_heatmap(
     blur_sigma=3.0,
     save_topk=0,
     save_panels=False,
+    context_size=0,
 ):
     """Generate a multi-panel heatmap figure for one slide.
 
@@ -295,8 +296,11 @@ def generate_heatmap(
 
     # 10. Top-k patch crops
     topk_crops = []
+    context_crops = []
     if save_topk > 0 and has_filtered:
         topk_indices = np.argsort(abmil_attn)[-save_topk:][::-1]
+        wsi_w, wsi_h = wsi.level_dimensions[0]
+
         for rank, idx in enumerate(topk_indices):
             x, y = int(filt_coords[idx][0]), int(filt_coords[idx][1])
             patch = wsi.read_region((x, y), 0, (patch_size_lvl0, patch_size_lvl0)).convert("RGB")
@@ -309,6 +313,41 @@ def generate_heatmap(
                 topk_dir,
                 f"rank{rank+1}_attn{abmil_attn[idx]:.4f}_lvi{patch_lvi_probs[idx]:.3f}_x{x}_y{y}.png"
             ))
+
+            # Context crop: larger region centered on the patch
+            if context_size > 0:
+                ctx = context_size
+                pad = (ctx - patch_size_lvl0) // 2
+                cx = max(x - pad, 0)
+                cy = max(y - pad, 0)
+                # Clamp to WSI bounds
+                cx = min(cx, max(wsi_w - ctx, 0))
+                cy = min(cy, max(wsi_h - ctx, 0))
+                actual_w = min(ctx, wsi_w - cx)
+                actual_h = min(ctx, wsi_h - cy)
+
+                ctx_img = wsi.read_region((cx, cy), 0, (actual_w, actual_h)).convert("RGB")
+                ctx_arr = np.array(ctx_img)
+
+                # Draw the original patch boundary
+                rx = x - cx  # patch origin relative to context crop
+                ry = y - cy
+                lw = max(4, ctx // 300)  # border thickness scales with context size
+                cv2.rectangle(ctx_arr,
+                              (rx, ry),
+                              (rx + patch_size_lvl0, ry + patch_size_lvl0),
+                              (0, 255, 0), lw)
+
+                context_crops.append((ctx_arr, abmil_attn[idx], patch_lvi_probs[idx]))
+
+                ctx_path = os.path.join(
+                    topk_dir,
+                    f"rank{rank+1}_context{ctx}_attn{abmil_attn[idx]:.4f}_lvi{patch_lvi_probs[idx]:.3f}_x{x}_y{y}.png"
+                )
+                Image.fromarray(ctx_arr).save(ctx_path, quality=95)
+
+        if context_crops:
+            print(f"    Context crops ({context_size}px): saved {len(context_crops)} to {topk_dir}")
 
     wsi.close()
 
@@ -460,6 +499,7 @@ def main():
     parser.add_argument("--blur", type=float, default=3.0, help="Gaussian blur sigma")
     parser.add_argument("--save_topk", type=int, default=5, help="Save top-k attended patches (0 to skip)")
     parser.add_argument("--save_panels", action="store_true", help="Save each panel as a standalone high-res image")
+    parser.add_argument("--context_size", type=int, default=0, help="Context crop size in level-0 pixels (e.g. 4096). 0 to skip.")
     args = parser.parse_args()
 
     set_seed()
@@ -479,6 +519,7 @@ def main():
             vis_level=args.vis_level, alpha=args.alpha,
             blur_sigma=args.blur, save_topk=args.save_topk,
             save_panels=args.save_panels,
+            context_size=args.context_size,
         )
     elif args.patient_id:
         pattern = os.path.join(FILTERED_FEATS, f"{args.patient_id}*.h5")
@@ -493,6 +534,7 @@ def main():
                 vis_level=args.vis_level, alpha=args.alpha,
                 blur_sigma=args.blur, save_topk=args.save_topk,
                 save_panels=args.save_panels,
+                context_size=args.context_size,
             )
     else:
         parser.error("Provide --slide_name or --patient_id")

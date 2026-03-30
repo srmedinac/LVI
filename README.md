@@ -65,6 +65,7 @@ results_2026/results/
 ├── mva_forest.R            # Multivariable Cox + forest plots
 ├── extra_analyses.py       # Attention violin plots + t-SNE
 ├── rna_angiogenesis.py     # Bulk RNA angiogenesis correlation (TCGA)
+├── rna_vascular_analysis.py # Expanded angiogenesis + lymphangiogenesis analysis
 ```
 
 ## Results
@@ -115,11 +116,15 @@ AI risk group remains significant (HR=4.16, p=0.021) after adjusting for pT stag
 
 High-risk patients show higher max attention weights and more concentrated attention (lower entropy), consistent with the model focusing on specific vessel-adjacent regions.
 
-### RNA Angiogenesis Correlation (TCGA)
+### RNA Vascular Gene Expression (TCGA)
 
-![RNA Angiogenesis](figures/rna_angiogenesis_tcga.png)
+![Vascular Gene Analysis](figures/rna_vascular_analysis_tcga.png)
 
-High AI risk associated with higher angiogenesis gene expression (p=0.016), providing biological validation that the model captures vascular biology.
+Gene-level differential expression analysis of 31 angiogenesis and lymphangiogenesis genes between AI risk groups. Three genes survive FDR correction: **VEGFC** (lymphatic growth factor, FDR=0.038), **PDPN** (podoplanin, lymphatic marker, FDR=0.039), and **PDGFRβ** (pericyte marker, FDR=0.038).
+
+![VEGFC & Lymphangiogenesis](figures/rna_vegfc_lymphangiogenesis.png)
+
+VEGFC expression is significantly elevated in high-risk patients (p=0.0016) and positively correlated with AI risk score (Spearman ρ=0.205, p=0.0008). The VEGFC→lymphangiogenesis axis (VEGFC, PDPN, ADAMTS3, NRP2) is coherently upregulated, providing biological validation that the model captures lymphovascular biology.
 
 ## Workflow
 
@@ -195,6 +200,9 @@ python -m pipeline.visualize --patient_id 577-3428
 
 # With top-k patch crops saved separately
 python -m pipeline.visualize --patient_id 577-3428 --save_topk 5
+
+# With larger context crops (4096px) centered on top-k patches
+python -m pipeline.visualize --patient_id 577-3428 --save_topk 5 --context_size 4096
 ```
 
 ![Heatmap Example](figures/heatmap_example.png)
