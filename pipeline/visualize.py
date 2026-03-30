@@ -179,6 +179,7 @@ def generate_heatmap(
     alpha=0.5,
     blur_sigma=3.0,
     save_topk=0,
+    save_panels=False,
 ):
     """Generate a multi-panel heatmap figure for one slide.
 
@@ -311,6 +312,53 @@ def generate_heatmap(
 
     wsi.close()
 
+    # ── Save individual panels ───────────────────────────────────────────────
+    if save_panels:
+        os.makedirs(output_dir, exist_ok=True)
+        clean_name = slide_name.replace(" ", "_").replace(":", "-")
+        panels_dir = os.path.join(output_dir, f"panels_{clean_name}")
+        os.makedirs(panels_dir, exist_ok=True)
+
+        # Raw panels as high-res images
+        panel_images = {
+            "A_HE_overview": wsi_img,
+            "B_YOLO_detections": yolo_panel,
+            "C_LVI_probability": lvi_blended,
+            "D_ABMIL_attention": attn_blended,
+        }
+        for name, img_arr in panel_images.items():
+            Image.fromarray(img_arr).save(
+                os.path.join(panels_dir, f"{name}.png"), quality=95,
+            )
+
+        # Colorbars as standalone images
+        for cmap_name, label, fname in [
+            ("Reds", "Patch LVI Probability", "colorbar_lvi"),
+            ("coolwarm", "ABMIL Attention", "colorbar_attention"),
+        ]:
+            fig_cb, ax_cb = plt.subplots(figsize=(1.2, 4), facecolor="white")
+            sm = plt.cm.ScalarMappable(
+                cmap=plt.get_cmap(cmap_name), norm=Normalize(vmin=0, vmax=1),
+            )
+            sm.set_array([])
+            cbar = fig_cb.colorbar(sm, cax=ax_cb)
+            cbar.set_label(label, fontsize=12, fontweight="bold")
+            cbar.ax.tick_params(labelsize=10)
+            fig_cb.savefig(
+                os.path.join(panels_dir, f"{fname}.png"),
+                dpi=300, bbox_inches="tight", facecolor="white", pad_inches=0.1,
+            )
+            plt.close(fig_cb)
+
+        # Top-k crops as individual high-res images
+        for i, (crop, attn_val, lvi_val) in enumerate(topk_crops):
+            Image.fromarray(crop).save(
+                os.path.join(panels_dir, f"topk_{i+1}_attn{attn_val:.3f}_lvi{lvi_val:.2f}.png"),
+                quality=95,
+            )
+
+        print(f"    Panels saved to: {panels_dir}")
+
     # ── Build the figure ─────────────────────────────────────────────────────
 
     has_topk = len(topk_crops) > 0
@@ -411,6 +459,7 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.5, help="Heatmap blend alpha")
     parser.add_argument("--blur", type=float, default=3.0, help="Gaussian blur sigma")
     parser.add_argument("--save_topk", type=int, default=5, help="Save top-k attended patches (0 to skip)")
+    parser.add_argument("--save_panels", action="store_true", help="Save each panel as a standalone high-res image")
     args = parser.parse_args()
 
     set_seed()
@@ -429,6 +478,7 @@ def main():
             args.slide_name, model, output_dir,
             vis_level=args.vis_level, alpha=args.alpha,
             blur_sigma=args.blur, save_topk=args.save_topk,
+            save_panels=args.save_panels,
         )
     elif args.patient_id:
         pattern = os.path.join(FILTERED_FEATS, f"{args.patient_id}*.h5")
@@ -442,6 +492,7 @@ def main():
                 slide_name, model, output_dir,
                 vis_level=args.vis_level, alpha=args.alpha,
                 blur_sigma=args.blur, save_topk=args.save_topk,
+                save_panels=args.save_panels,
             )
     else:
         parser.error("Provide --slide_name or --patient_id")
