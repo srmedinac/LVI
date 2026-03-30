@@ -282,12 +282,15 @@ def generate_heatmap(
     lvi_blended = blend_overlay(wsi_img.copy(), lvi_overlay, "Reds",
                                 alpha=alpha, blur_sigma=blur_sigma)
 
-    # 9. YOLO boxes panel
+    # 9. YOLO boxes panel — filled semi-transparent rectangles for visibility
     yolo_panel = wsi_img.copy()
     if len(yolo_boxes) > 0:
+        yolo_overlay = wsi_img.copy()
         for box in yolo_boxes:
             x1, y1, x2, y2 = (box * scale[0]).astype(int)
-            cv2.rectangle(yolo_panel, (x1, y1), (x2, y2), (0, 200, 0), 2)
+            cv2.rectangle(yolo_overlay, (x1, y1), (x2, y2), (0, 220, 0), -1)
+            cv2.rectangle(yolo_overlay, (x1, y1), (x2, y2), (0, 160, 0), 2)
+        yolo_panel = cv2.addWeighted(wsi_img, 0.65, yolo_overlay, 0.35, 0)
 
     # 10. Top-k patch crops
     topk_crops = []
@@ -314,9 +317,9 @@ def generate_heatmap(
     height_ratios = [1, 0.25] if has_topk else [1]
     nrows = 2 if has_topk else 1
 
-    fig = plt.figure(figsize=(22, 6.5 * nrows), facecolor="white", dpi=150)
+    fig = plt.figure(figsize=(24, 7 * nrows), facecolor="white", dpi=150)
     gs = gridspec.GridSpec(nrows, 4, figure=fig, height_ratios=height_ratios,
-                           hspace=0.15, wspace=0.05)
+                           hspace=0.2, wspace=0.08)
 
     panels = [
         (wsi_img, "A. H&E Overview", None, None),
@@ -340,8 +343,10 @@ def generate_heatmap(
             sm = plt.cm.ScalarMappable(cmap=plt.get_cmap(cmap_name),
                                        norm=Normalize(vmin=clim[0], vmax=clim[1]))
             sm.set_array([])
-            cbar = plt.colorbar(sm, ax=ax, fraction=0.03, pad=0.02, shrink=0.6)
-            cbar.ax.tick_params(labelsize=8)
+            cbar = plt.colorbar(sm, ax=ax, fraction=0.035, pad=0.02, shrink=0.5,
+                                aspect=20)
+            cbar.ax.tick_params(labelsize=7)
+            cbar.outline.set_linewidth(0.5)
 
         panel_axes.append(ax)
 
@@ -359,13 +364,14 @@ def generate_heatmap(
         for i, (crop, attn_val, lvi_val) in enumerate(topk_crops):
             ax = fig.add_subplot(gs_crops[0, i])
             ax.imshow(crop)
-            ax.set_title(f"#{i+1}\nattn={attn_val:.3f} | LVI={lvi_val:.2f}",
-                         fontsize=9, fontweight="bold", pad=4)
+            border_color = "#e74c3c" if lvi_val > 0.5 else "#3498db"
+            ax.set_title(f"#{i+1}  attn={attn_val:.3f}  LVI={lvi_val:.2f}",
+                         fontsize=10, fontweight="bold", pad=6, color="#2c3e50")
             ax.set_xticks([])
             ax.set_yticks([])
             for spine in ax.spines.values():
-                spine.set_linewidth(1.5)
-                spine.set_color("#e74c3c" if lvi_val > 0.5 else "#3498db")
+                spine.set_linewidth(3)
+                spine.set_color(border_color)
 
     # Suptitle with patient info
     patient_id = slide_name.split("_")[0] if "_" in slide_name else slide_name
@@ -373,10 +379,10 @@ def generate_heatmap(
     lvi_label = f"LVI Prob: {lvi_prob:.3f}"
 
     fig.suptitle(
-        f"Patient {patient_id}  |  Risk: {risk:.2f} ({risk_label})  |  "
-        f"{lvi_label}  |  Vessel Patches: {n_filtered}/{len(all_coords)}  |  "
+        f"Patient {patient_id}   |   Risk: {risk:.2f} ({risk_label})   |   "
+        f"{lvi_label}   |   Vessel Patches: {n_filtered}/{len(all_coords)}   |   "
         f"YOLO Boxes: {len(yolo_boxes)}",
-        fontsize=12, fontweight="bold", y=1.01, color="#2c3e50",
+        fontsize=14, fontweight="bold", y=1.02, color="#2c3e50",
     )
 
     # Save
